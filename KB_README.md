@@ -99,6 +99,63 @@ Start interactive mode with source citations:
 python query_knowledge_base.py --show-sources
 ```
 
+## Multi-Agent Supervisor Architecture
+
+This project now includes a sophisticated multi-agent architecture powered by LangGraph, allowing for domain-specific knowledge retrieval and conversational memory.
+
+### Key Features
+
+- **Supervisor Agent**: Routes queries to the appropriate specialist agent based on topic and conversation context
+- **Consolidated Domain Agents**: Specialized agents with access to domain-specific knowledge bases
+- **Conversational Memory**: Maintains context across conversation turns, enabling follow-up questions
+
+### Available Agents
+
+- **RealEstateAgent**: Handles questions about general real property, assessments, mapping, etc.
+- **OwnershipTransferAgent**: Specializes in property transfers, Prop 58/193, Prop 19, etc.
+- **BusinessPersonalAgent**: Focuses on business personal property, boats, aircraft, etc.
+- **ExemptionsAppealsAgent**: Addresses exemptions and assessment appeals processes
+
+### Usage
+
+1. First, ensure you've imported your knowledge base with the consolidated agent structure:
+
+```bash
+python import_knowledge_base.py --source /path/to/your/knowledge_base
+```
+
+2. Run the supervisor-based interactive interface:
+
+```bash
+python supervisor_main.py
+```
+
+3. Ask questions naturally. The system will:
+   - Route your question to the most relevant agent
+   - Allow follow-up questions that reference previous context
+   - Maintain conversation history for more accurate responses
+
+### How It Works
+
+1. The `supervisor_main.py` script defines a LangGraph workflow where:
+   - A supervisor node analyzes incoming queries and routes them to specialist agents
+   - Specialist agents retrieve information from their domain-specific vector stores
+   - All messages are accumulated in the conversation history
+
+2. The `agent_tools.py` script provides:
+   - Tools for creating RAG chains customized for each domain
+   - Conversational memory management functions
+   - Question condensation for handling follow-up questions
+
+### Customization
+
+You can customize various aspects of the supervisor architecture:
+
+- Adjust routing behavior in the `create_supervisor_node()` function
+- Modify agent prompts in the `create_specialist_rag_chain()` function
+- Change the number of retrieved documents by adjusting the `k_value` parameter
+- Add new specialist agents by updating the `agent_sources` dictionary in `import_knowledge_base.py`
+
 ## Customization
 
 ### Handling Different File Types

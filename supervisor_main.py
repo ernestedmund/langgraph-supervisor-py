@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.pydantic_v1 import BaseModel, Field
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import tools_condition
@@ -49,35 +50,67 @@ consolidated_dbs = {
 }
 
 def create_supervisor_node():
-    """Creates the supervisor node runnable."""
+    """Creates the supervisor node runnable, considering chat history."""
     get_openai_api_key()
     llm = ChatOpenAI(model="gpt-4o", temperature=0)
     
-    # Create the routing prompt - Updated for consolidated agents
+    # Create the routing prompt - Updated to accept history
     system_prompt = (
-        "You are a supervisor routing user queries to the correct specialist agent. "
-        "Based on the user's query, determine which of the following consolidated agents is best suited to answer it. "
+        "You are a supervisor routing user queries and conversation turns to the correct specialist agent. "
+        "Based on the CURRENT user query AND the PRECEDING conversation history, determine which agent should handle the next step. "
         "Do not answer the question yourself, only route it."
         "Available agents:\n"
         f"- RealEstateAgent: Handles questions about general real property (residential, commercial, manufactured housing), assessments, value changes (Prop 8), new construction, supplemental assessments, calamities, mapping/lot lines, restricted properties (CLCA), and general tax definitions/processes.\n"
         f"- OwnershipTransferAgent: Handles questions specifically about property transfers, changes in ownership, exclusions (parent-child/Prop 58/193, spousal/Prop 19), trusts, and legal entity transfers.\n"
         f"- BusinessPersonalAgent: Handles questions about business personal property assessments, 571-L forms, boats, and aircraft.\n"
         f"- ExemptionsAppealsAgent: Handles questions about property tax exemptions (homeowner, veteran, non-profit, religious, welfare, etc.) AND the assessment appeals process.\n\n"
-        "Route to FINISH if the query is unclear, a simple follow-up like 'thank you', or doesn't seem to fit any category clearly."
-        "\nUser Query:\n{query}"
+        "Routing Rules:"
+        "- If the CURRENT query looks like an answer from another agent, route to FINISH. Do NOT route an agent's answer back to another agent."
+        "- If the user asks a new question fitting a specific category, route to that agent."
+        "- If the user asks a follow-up question, consider the history and route to the agent relevant to the *original topic* or the agent that last spoke, if appropriate."
+        "- Route to FINISH if the query is unclear, a simple closing like 'thank you' or 'okay', or if the conversation seems complete."
+        "\nConversation History (newest messages last):\n{history}"
+        "\nCURRENT Query to Route:\n{query}" # Renamed for clarity
     )
     
-    prompt = ChatPromptTemplate.from_messages([("system", system_prompt)])
+    # Use ChatPromptTemplate for easier message handling
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        # Placeholder for history - LangGraph handles this, but we structure the prompt this way
+        # We will format the history before passing it to the chain.
+    ])
+    
     routing_chain = prompt | llm.with_structured_output(RouteQuery)
     
+    def format_history_for_prompt(messages: Sequence[Dict[str, Any]]) -> str:
+        """Formats the message history for the supervisor prompt."""
+        formatted = []
+        for msg in messages:
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            # Simple formatting, adjust as needed
+            formatted.append(f"{role.capitalize()}: {content}") 
+        return "\n".join(formatted)
+
     # The node function
     def supervisor(state: AgentState):
         print("---SUPERVISOR--- ")
-        last_message_content = state["messages"][-1]["content"]
-        print(f"Routing query: '{last_message_content}'")
+        all_messages = state["messages"]
+        # The latest message is the query we need to route
+        current_query = all_messages[-1]["content"]
+        # The history is everything *before* the latest message
+        history_messages = all_messages[:-1]
         
-        # Invoke the combined chain
-        route = routing_chain.invoke({"query": last_message_content})
+        formatted_history = format_history_for_prompt(history_messages)
+        
+        print(f"Routing query: '{current_query}'")
+        print(f"With history: \n{formatted_history}")
+        
+        # Invoke the chain with history and the current query
+        route = routing_chain.invoke({
+            "history": formatted_history,
+            "query": current_query 
+        })
         
         print(f"Decision: Route to {route.destination}")
         return {"next_node": route.destination}
@@ -85,32 +118,40 @@ def create_supervisor_node():
     return supervisor
 
 # 2. Specialist Agent Nodes
-# We create these dynamically based on the found databases
 def create_specialist_node(agent_name: str, db_path: str):
     """Creates a node that runs the RAG chain for a specific agent."""
-    # Create the chain *once* when the node function is defined
-    rag_chain = create_specialist_rag_chain(db_path) 
+    rag_chain = create_specialist_rag_chain(db_path)
     
     def agent_node(state: AgentState):
         print(f"---{agent_name}--- ")
-        query = state["messages"][-1]["content"]
-        print(f"Processing query: '{query}'")
+        # Get the full message history
+        messages = state["messages"]
+        # The user query is the last message
+        query = messages[-1]["content"]
+        # The history is everything before the last message
+        chat_history = messages[:-1]
         
-        # Simplified invocation and error handling
+        print(f"Processing query: '{query}'")
+        if chat_history:
+             print(f"With history: {len(chat_history)} previous messages")
+        
+        # Prepare input dictionary for the RAG chain
+        rag_input = {"question": query, "chat_history": chat_history}
+        
         try:
-            # Directly invoke the chain returned by the factory function
-            answer = rag_chain.invoke(query)
+            # Invoke the chain with the input dictionary
+            answer = rag_chain.invoke(rag_input)
             print(f"Generated answer.")
             
-            # Check if the answer indicates an internal error from chain creation
             if isinstance(answer, str) and answer.startswith("Error accessing knowledge base"):
                 print(f"Warning: RAG chain creation failed for {agent_name}: {answer}")
-                # Pass the specific error message along
                 
         except Exception as e:
-            # Catch errors during the actual invocation
             print(f"Error invoking RAG chain for {agent_name}: {e}")
-            answer = f"An error occurred while processing the request with {agent_name}. Details: {e}"
+            # Format exception details into the answer
+            import traceback
+            tb_str = traceback.format_exc()
+            answer = f"An error occurred while processing the request with {agent_name}. Details: {e}\n{tb_str}"
             
         # Return response
         return {"messages": [{"role": agent_name, "content": answer}]}
@@ -142,7 +183,7 @@ for agent_name, db_path in consolidated_dbs.items():
 if not specialist_nodes:
     raise ValueError("No consolidated specialist agent databases found! Cannot build graph.")
 
-# Define conditional edges (routing logic is the same, uses new agent names)
+# Define conditional edges: after supervisor, route to the chosen specialist or end
 def route_to_specialist(state: AgentState):
     destination = state.get("next_node")
     if destination == "FINISH" or destination not in specialist_nodes:
@@ -155,12 +196,13 @@ def route_to_specialist(state: AgentState):
 workflow.add_conditional_edges(
     "Supervisor",
     route_to_specialist,
-    list(specialist_nodes.keys()) + [END] # Uses keys from consolidated_dbs
+    list(specialist_nodes.keys()) + [END]
 )
 
-# Define edges: route specialists to END (prevents loops for now)
+# Define edges: after any specialist agent runs, route back to supervisor
+# This allows for conversational follow-up.
 for agent_name in specialist_nodes.keys():
-     workflow.add_edge(agent_name, END) 
+     workflow.add_edge(agent_name, "Supervisor") # Changed back from END
 
 workflow.set_entry_point("Supervisor")
 
@@ -174,23 +216,38 @@ if __name__ == "__main__":
     print("\nEnter your query to start the agent conversation.")
     print("Type 'exit', 'quit', or 'q' to end.")
 
+    # Maintain the conversation history messages here
+    conversation_messages = []
+
     while True:
         user_input = input("\nUser Query: ")
         if user_input.lower() in ["exit", "quit", "q"]:
             break
         
-        # Prepare initial state
-        initial_state = {"messages": [{"role": "user", "content": user_input}]}
+        # Add the new user message to the conversation history
+        conversation_messages.append({"role": "user", "content": user_input})
+        
+        # Prepare state using the CURRENT conversation history
+        current_state = {"messages": conversation_messages}
         
         print("---Invoking Graph--- ")
-        final_state = app.invoke(initial_state)
+        # Invoke the graph with the current state
+        final_state = app.invoke(current_state)
         
-        # Print the final response (likely the last message from a specialist agent)
-        if final_state and "messages" in final_state and final_state["messages"]:
-            last_agent_message = final_state["messages"][-1]
-            print(f"\nFinal Answer ({last_agent_message.get('role', 'Agent')}):")
-            print(last_agent_message.get("content", "No content found."))
+        # Update conversation history with the messages generated by the graph run
+        # Note: LangGraph state includes *all* messages, including the input user message
+        # We need to store the final state's messages for the next turn.
+        conversation_messages = final_state.get("messages", []) 
+        
+        # Print the final response (the last message added by the graph)
+        if conversation_messages:
+            last_agent_message = conversation_messages[-1]
+            # Avoid printing if the last message was just the user input (e.g., if graph routed straight to END)
+            if last_agent_message.get("role") != "user":
+                 print(f"\nFinal Answer ({last_agent_message.get('role', 'Agent')}):")
+                 print(last_agent_message.get("content", "No content found."))
+            # Handle cases where the graph might end without an agent response? Maybe just pass.
         else:
-            print("\nNo final answer generated by the graph.")
+            print("\nGraph execution finished, but no messages found in the final state.")
 
     print("\nConversation ended.") 
